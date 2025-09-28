@@ -15,6 +15,8 @@ pub const CHUNK_VOLUME: usize =
 pub const FIXED_STEP_SECONDS: f32 = 1.0 / 60.0;
 /// Bias applied to chunk coordinates before Morton encoding.
 const MORTON_BIAS: i32 = 1 << 20;
+/// Maximum number of fixed steps processed per frame to avoid spiraling.
+const MAX_STEPS_PER_FRAME: u32 = 8;
 
 /// Packed material/flag state stored per voxel.
 #[repr(transparent)]
@@ -422,6 +424,25 @@ impl ChunkSnapshots {
             self.map.insert(coords, snapshot);
         }
     }
+
+    pub fn insert(&mut self, coords: IVec3, snapshot: Arc<[AutomataState]>) {
+        self.map.insert(coords, snapshot);
+    }
+}
+
+fn accumulate_steps(clock: &mut SimulationClock, delta_seconds: f32, speed: &SimulationSpeed) {
+    clock.accumulator += delta_seconds * speed.factor;
+    clock.steps_requested = 0;
+    clock.executed_step = false;
+
+    while clock.accumulator >= FIXED_STEP_SECONDS && clock.steps_requested < MAX_STEPS_PER_FRAME {
+        clock.accumulator -= FIXED_STEP_SECONDS;
+        clock.steps_requested += 1;
+    }
+
+    if clock.steps_requested == MAX_STEPS_PER_FRAME && clock.accumulator >= FIXED_STEP_SECONDS {
+        clock.accumulator = FIXED_STEP_SECONDS;
+    }
 }
 
 /// Systems executed by the [`CellularAutomataPlugin`].
@@ -456,15 +477,7 @@ fn tick_simulation(
     mut clock: ResMut<SimulationClock>,
     speed: Res<SimulationSpeed>,
 ) {
-    let delta = time.delta_seconds();
-    clock.accumulator += delta * speed.factor;
-    clock.steps_requested = 0;
-    clock.executed_step = false;
-
-    if clock.accumulator >= FIXED_STEP_SECONDS {
-        clock.accumulator -= FIXED_STEP_SECONDS;
-        clock.steps_requested = 1;
-    }
+    accumulate_steps(&mut clock, time.delta_seconds(), &speed);
 }
 
 fn snapshot_chunks(
@@ -494,35 +507,55 @@ fn step_chunks(
     mut clock: ResMut<SimulationClock>,
     mut speed: ResMut<SimulationSpeed>,
     mut budget: ResMut<SimulationBudget>,
-    snapshots: Res<ChunkSnapshots>,
+    mut snapshots: ResMut<ChunkSnapshots>,
     rule: Res<AutomataRule>,
     query: Query<(Entity, &ChunkKey)>,
     cells_query: Query<&ChunkCells>,
     mut next_query: Query<&mut ChunkCellsNext>,
 ) {
-    if clock.steps_requested == 0 {
+    let steps = clock.steps_requested.min(MAX_STEPS_PER_FRAME);
+    if steps == 0 {
         return;
     }
 
+    let chunk_count = query.iter().len();
     let start = Instant::now();
-    let mut results = Vec::with_capacity(query.iter().len());
+    let mut results: Vec<(Entity, IVec3, Vec<AutomataState>)> = Vec::with_capacity(chunk_count);
 
-    for (entity, key) in query.iter() {
-        if let Some(snapshot) = snapshots.get(key.coords) {
-            let mut buffer = vec![AutomataState::default(); CHUNK_VOLUME];
-            step_chunk(snapshot, key.coords, &snapshots, &rule, &mut buffer);
-            results.push((entity, buffer));
-        } else if let Ok(cells) = cells_query.get(entity) {
-            // No snapshot available (chunk added mid-frame); fall back to current cells.
-            let mut buffer = vec![AutomataState::default(); CHUNK_VOLUME];
-            step_chunk(cells.as_slice(), key.coords, &snapshots, &rule, &mut buffer);
-            results.push((entity, buffer));
+    for step_index in 0..steps {
+        results.clear();
+
+        for (entity, key) in query.iter() {
+            if let Some(snapshot) = snapshots.get(key.coords) {
+                let mut buffer = vec![AutomataState::default(); CHUNK_VOLUME];
+                step_chunk(snapshot, key.coords, &*snapshots, &rule, &mut buffer);
+                results.push((entity, key.coords, buffer));
+            } else if let Ok(cells) = cells_query.get(entity) {
+                // No snapshot available (chunk added mid-frame); fall back to current cells.
+                let mut buffer = vec![AutomataState::default(); CHUNK_VOLUME];
+                step_chunk(
+                    cells.as_slice(),
+                    key.coords,
+                    &*snapshots,
+                    &rule,
+                    &mut buffer,
+                );
+                results.push((entity, key.coords, buffer));
+            }
         }
-    }
 
-    for (entity, buffer) in results {
-        if let Ok(mut next) = next_query.get_mut(entity) {
-            next.as_mut_slice().copy_from_slice(&buffer);
+        let last_step = step_index == steps - 1;
+
+        for (entity, coords, buffer) in results.drain(..) {
+            let boxed = buffer.into_boxed_slice();
+
+            if last_step {
+                if let Ok(mut next) = next_query.get_mut(entity) {
+                    next.as_mut_slice().copy_from_slice(&boxed);
+                }
+            }
+
+            snapshots.insert(coords, Arc::from(boxed));
         }
     }
 
@@ -660,6 +693,10 @@ fn part1by2(mut n: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::Flags;
+    use bevy::ecs::{
+        system::{Query, Res, ResMut, SystemState},
+        world::World,
+    };
     use std::collections::HashSet;
 
     #[test]
@@ -698,5 +735,67 @@ mod tests {
             IVec3::new(CHUNK_EDGE - 1, CHUNK_EDGE - 1, CHUNK_EDGE - 1),
         );
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn multiple_steps_drain_accumulator() {
+        let mut world = World::default();
+        world.insert_resource(SimulationClock::default());
+        world.insert_resource(SimulationSpeed::default());
+        world.insert_resource(SimulationBudget::default());
+        world.insert_resource(ChunkSnapshots::default());
+        world.insert_resource(ChunkIndex::default());
+        world.insert_resource(AutomataRule::default());
+
+        world.spawn(ChunkBundle::new(IVec3::ZERO));
+
+        let speed_clone = { world.resource::<SimulationSpeed>().clone() };
+        {
+            let mut clock = world.resource_mut::<SimulationClock>();
+            accumulate_steps(&mut clock, FIXED_STEP_SECONDS * 3.5, &speed_clone);
+        }
+
+        {
+            let mut system_state: SystemState<(
+                ResMut<ChunkSnapshots>,
+                ResMut<ChunkIndex>,
+                Res<SimulationClock>,
+                Query<(Entity, &ChunkKey, &ChunkCells)>,
+            )> = SystemState::new(&mut world);
+            let (snapshots, index, clock, query) = system_state.get_mut(&mut world);
+            snapshot_chunks(snapshots, index, clock, query);
+            system_state.apply(&mut world);
+        }
+
+        {
+            let mut system_state: SystemState<(
+                ResMut<SimulationClock>,
+                ResMut<SimulationSpeed>,
+                ResMut<SimulationBudget>,
+                ResMut<ChunkSnapshots>,
+                Res<AutomataRule>,
+                Query<(Entity, &ChunkKey)>,
+                Query<&ChunkCells>,
+                Query<&mut ChunkCellsNext>,
+            )> = SystemState::new(&mut world);
+            let (clock, speed, budget, snapshots, rule, query, cells_query, next_query) =
+                system_state.get_mut(&mut world);
+            step_chunks(
+                clock,
+                speed,
+                budget,
+                snapshots,
+                rule,
+                query,
+                cells_query,
+                next_query,
+            );
+            system_state.apply(&mut world);
+        }
+
+        let clock = world.resource::<SimulationClock>();
+        assert!(clock.accumulator < FIXED_STEP_SECONDS);
+        assert_eq!(clock.steps_requested, 0);
+        assert!(clock.executed_step);
     }
 }
