@@ -24,8 +24,9 @@ impl FromWorld for Pipeline {
         let compute_bind_group_layout = world.resource::<ComputeData>().bind_group_layout.clone();
 
         let asset_server = world.resource_mut::<AssetServer>();
-        let shader = asset_server.load("embedded://bevy_voxel_engine/voxel_pipeline/compute/automata.wgsl");
-        
+        let shader =
+            asset_server.load("embedded://bevy_voxel_engine/voxel_pipeline/compute/automata.wgsl");
+
         let pipeline_cache = world.resource_mut::<PipelineCache>();
         let update_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some(Cow::from("automata pipeline")),
