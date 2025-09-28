@@ -286,7 +286,7 @@ impl SpecializedMeshPipeline for VoxelizationPipeline {
         descriptor.vertex.shader = VOXELIZATION_SHADER_HANDLE;
         descriptor.fragment.as_mut().unwrap().shader = VOXELIZATION_SHADER_HANDLE;
 
-        // 
+        //
         descriptor
             .vertex
             .shader_defs
