@@ -4,6 +4,11 @@ use bevy::{
 };
 use physics::PhysicsPlugin;
 pub use physics::VOXELS_PER_METER;
+pub use simulation::{
+    AutomataRule, AutomataState, CellularAutomataPlugin, ChunkBundle, ChunkCells, ChunkCellsNext,
+    ChunkIndex, ChunkKey, SimulationBudget, SimulationClock, SimulationSet, SimulationSpeed,
+    CHUNK_EDGE, CHUNK_VOLUME, FIXED_STEP_SECONDS,
+};
 use voxel_pipeline::RenderPlugin;
 pub use voxel_pipeline::{
     trace::TraceSettings, voxelization::VoxelizationMaterial,
@@ -12,6 +17,7 @@ pub use voxel_pipeline::{
 
 mod load;
 mod physics;
+mod simulation;
 mod voxel_pipeline;
 
 #[derive(Component)]
@@ -156,6 +162,7 @@ impl Plugin for BevyVoxelEnginePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Msaa::Off)
             .add_plugins(PhysicsPlugin)
+            .add_plugins(CellularAutomataPlugin)
             .add_plugins(RenderPlugin);
     }
 }
